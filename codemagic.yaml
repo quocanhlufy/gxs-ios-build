@@ -1,0 +1,72 @@
+# GxS (Girl x Senpai) on Codemagic: the iOS pieces that need a Mac.
+#   tolua: libtolua.a only (a few minutes): to check the native library builds.
+#   ipa:   libtolua.a, then the Xcode project Unity exported on Windows (GxsBuild › Build beta (iOS, Xcode project)),
+#          downloaded from XCODE_ZIP_URL (a .tar.gz of betatest/GxS-iOS), built unsigned -> GxS-unsigned.ipa,
+#          to be signed by the signing service.
+# XCODE_ZIP_URL is set in Codemagic: App settings › Environment variables, group "gxs".
+workflows:
+  tolua:
+    name: libtolua.a (iOS)
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+    environment:
+      xcode: latest
+    scripts:
+      - name: Build libtolua.a
+        script: bash build_ios_gxs.sh
+    artifacts:
+      - out/libtolua.a
+
+  ipa:
+    name: GxS unsigned IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: latest
+      groups:
+        - gxs
+    scripts:
+      - name: Build libtolua.a
+        script: bash build_ios_gxs.sh
+      - name: Download the Xcode project
+        script: |
+          set -e
+          curl -fL --retry 3 -o xcode.tar.gz "$XCODE_ZIP_URL"
+          mkdir -p xcode && tar -xzf xcode.tar.gz -C xcode
+          rm xcode.tar.gz
+          P="$(dirname "$(find xcode -maxdepth 3 -name Unity-iPhone.xcodeproj | head -1)")"
+          echo "PROJ=$CM_BUILD_DIR/$P" >> $CM_ENV
+      - name: Prepare the project (files made on Windows)
+        script: |
+          set -e
+          cd "$PROJ"
+          # Windows drops the executable bit and may add CRLF to scripts
+          find . -name "*.sh" -exec sed -i '' $'s/\r$//' {} \; -exec chmod +x {} \;
+          chmod -R +x Il2CppOutputProject/IL2CPP/build/deploy_arm64 Il2CppOutputProject/IL2CPP/build/deploy_x86_64 || true
+          # the library built above in place of the stand-in Unity exported
+          L="$(find . -path "*Plugins/iOS/libtolua.a" | head -1)"
+          if [ -z "$L" ]; then echo "libtolua.a is not in the Xcode project: export it again with Assets/Plugins/iOS/libtolua.a"; exit 1; fi
+          cp "$CM_BUILD_DIR/out/libtolua.a" "$L"
+          echo "libtolua.a -> $L"
+      - name: Build the app (unsigned)
+        script: |
+          set -eo pipefail
+          mkdir -p "$CM_BUILD_DIR/build"
+          cd "$PROJ"
+          xcodebuild -project Unity-iPhone.xcodeproj -scheme Unity-iPhone -configuration Release \
+            -sdk iphoneos -destination "generic/platform=iOS" \
+            -archivePath "$CM_BUILD_DIR/build/GxS.xcarchive" archive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+            | tee "$CM_BUILD_DIR/build/xcodebuild.log" | xcpretty
+      - name: Make the .ipa
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR/build"
+          mkdir -p Payload
+          cp -R GxS.xcarchive/Products/Applications/*.app Payload/
+          zip -qry GxS-unsigned.ipa Payload
+          ls -la GxS-unsigned.ipa
+    artifacts:
+      - build/GxS-unsigned.ipa
+      - build/xcodebuild.log
+      - out/libtolua.a
